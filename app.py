@@ -23,16 +23,73 @@ st.set_page_config(
 # --------------------------------------------------
 IMAGE_DIR = "images"
 LOCAL_DATA_PATH = "responses.csv"
-N_FOILS = 4  # number of unseen images mixed into memory test
+N_FEED_ITEMS = 10
+N_FOILS = 4
 
 
 # --------------------------------------------------
 # Utility functions
 # --------------------------------------------------
+def infer_metadata_from_filename(filename: str) -> dict:
+    """
+    Infer simple metadata from the filename.
+    Current filenames supported:
+    beach.jpg
+    eiffel_bright.jpg
+    eiffel_dark.jpg
+    forest_bright.jpg
+    forest_dark.jpg
+    lighthouse_bright.jpg
+    lighthouse_brighter.jpg
+    lighthouse_darker.jpg
+    ocean_bright.jpg
+    ocean_dark.jpg
+    sunset_noperson.jpg
+    sunset_person.jpg
+    trees_bright.jpg
+    trees_dark.jpg
+    """
+    stem = os.path.splitext(filename)[0].lower()
+    tokens = stem.split("_")
+
+    category_map = {
+        "beach": "travel",
+        "eiffel": "travel",
+        "forest": "travel",
+        "lighthouse": "travel",
+        "ocean": "travel",
+        "sunset": "travel",
+        "trees": "travel",
+    }
+
+    base_token = tokens[0]
+    category = category_map.get(base_token, "unknown")
+
+    has_face = 1 if "person" in tokens else 0
+
+    if "bright" in tokens or "brighter" in tokens:
+        colorfulness = "bright"
+    elif "dark" in tokens or "darker" in tokens:
+        colorfulness = "dark"
+    else:
+        colorfulness = "unknown"
+
+    has_text = 0
+    visual_complexity = "unknown"
+
+    return {
+        "category": category,
+        "has_face": has_face,
+        "has_text": has_text,
+        "colorfulness": colorfulness,
+        "visual_complexity": visual_complexity,
+    }
+
+
 def load_stimuli(image_dir: str) -> list[dict]:
     """
     Load image filepaths from the images folder.
-    Returns a list of dicts so it is easy to expand later with metadata.
+    Returns a list of dicts with metadata inferred from filenames.
     """
     allowed_exts = {".png", ".jpg", ".jpeg", ".webp"}
 
@@ -43,24 +100,22 @@ def load_stimuli(image_dir: str) -> list[dict]:
     for fname in sorted(os.listdir(image_dir)):
         ext = os.path.splitext(fname)[1].lower()
         if ext in allowed_exts:
+            metadata = infer_metadata_from_filename(fname)
             files.append(
                 {
                     "post_id": os.path.splitext(fname)[0],
                     "image_path": os.path.join(image_dir, fname),
-                    # Expand later with labels like:
-                    # "has_face": 0/1,
-                    # "text_heavy": 0/1,
-                    # "colorfulness": "high/low"
+                    **metadata,
                 }
             )
+
     return files
 
 
 def initialize_session_state() -> None:
-    """Initialize all session variables used by the app."""
     defaults = {
         "participant_id": str(uuid.uuid4()),
-        "phase": "consent",  # consent -> feed -> distractor -> memory -> done
+        "phase": "consent",
         "stimuli": [],
         "feed_index": 0,
         "memory_index": 0,
@@ -77,26 +132,20 @@ def initialize_session_state() -> None:
 
 
 def prepare_experiment() -> None:
-    """
-    Load stimuli, randomize feed order, and prepare memory test items.
-    Assumes all images in IMAGE_DIR are potential stimuli.
-    """
     stimuli = load_stimuli(IMAGE_DIR)
 
-    if len(stimuli) < 8:
+    if len(stimuli) < N_FEED_ITEMS + N_FOILS:
         st.error(
-            "You need at least 8 images in your images/ folder before running the study."
+            f"You need at least {N_FEED_ITEMS + N_FOILS} images in your images/ folder."
         )
         st.stop()
 
     shuffled = stimuli.copy()
     random.shuffle(shuffled)
 
-    # Split into seen items and foil items
-    # You can adjust these numbers later depending on your design
-    seen_items = shuffled[:8]
-    remaining_items = shuffled[8:]
-    foil_items = remaining_items[: min(N_FOILS, len(remaining_items))]
+    seen_items = shuffled[:N_FEED_ITEMS]
+    remaining_items = shuffled[N_FEED_ITEMS:]
+    foil_items = remaining_items[:N_FOILS]
 
     memory_items = []
     for item in seen_items:
@@ -117,11 +166,9 @@ def prepare_experiment() -> None:
 
 
 def log_response(row: dict) -> None:
-    """Store a response row in session memory."""
     st.session_state.responses.append(row)
 
 
-# Placeholder local save. Replace later with Google Sheets / Supabase if desired.
 def save_responses_locally() -> None:
     if not st.session_state.responses:
         return
@@ -141,7 +188,7 @@ def save_responses_locally() -> None:
 # --------------------------------------------------
 def render_header() -> None:
     st.title("Social Media Memorability Study")
-    st.caption("A classroom research project on engagement, attention, and memory")
+    st.caption("A research project on engagement, attention, and memory")
 
 
 def render_progress(current: int, total: int, label: str) -> None:
@@ -160,7 +207,6 @@ def render_consent() -> None:
         "You are being asked to take part in a short study about how people view and remember social media content. "
         "Your responses are anonymous. Please do not enter any personal identifying information."
     )
-
     st.write(
         "By continuing, you confirm that you are at least 18 years old and consent to participate in this study."
     )
@@ -212,6 +258,11 @@ def render_feed() -> None:
                 "timestamp_utc": datetime.utcnow().isoformat(),
                 "phase": "feed",
                 "post_id": item["post_id"],
+                "category": item.get("category"),
+                "has_face": item.get("has_face"),
+                "has_text": item.get("has_text"),
+                "colorfulness": item.get("colorfulness"),
+                "visual_complexity": item.get("visual_complexity"),
                 "was_seen": 1,
                 "liked": 1 if like_clicked else 0,
                 "response": None,
@@ -234,9 +285,7 @@ def render_distractor() -> None:
     render_header()
 
     st.subheader("Quick reset task")
-    st.write(
-        "Before the memory section, please answer this simple question."
-    )
+    st.write("Before the memory section, please answer this simple question.")
 
     choice = st.radio(
         "Which of these do you prefer?",
@@ -251,6 +300,11 @@ def render_distractor() -> None:
                 "timestamp_utc": datetime.utcnow().isoformat(),
                 "phase": "distractor",
                 "post_id": None,
+                "category": None,
+                "has_face": None,
+                "has_text": None,
+                "colorfulness": None,
+                "visual_complexity": None,
                 "was_seen": None,
                 "liked": None,
                 "response": choice,
@@ -315,6 +369,11 @@ def render_memory_test() -> None:
                 "timestamp_utc": datetime.utcnow().isoformat(),
                 "phase": "memory",
                 "post_id": item["post_id"],
+                "category": item.get("category"),
+                "has_face": item.get("has_face"),
+                "has_text": item.get("has_text"),
+                "colorfulness": item.get("colorfulness"),
+                "visual_complexity": item.get("visual_complexity"),
                 "was_seen": item["was_seen"],
                 "liked": None,
                 "response": guessed_seen,
