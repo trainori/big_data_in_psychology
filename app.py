@@ -2,55 +2,49 @@ import os
 import time
 import uuid
 import random
+import requests
 from datetime import datetime
 
 import pandas as pd
 import streamlit as st
 
 
-# --------------------------------------------------
-# Page config
-# --------------------------------------------------
 st.set_page_config(
-    page_title="Social Media Memorability Study",
+    page_title="Social Media Study",
     page_icon="🧠",
     layout="centered",
 )
 
-
-# --------------------------------------------------
-# Configuration
-# --------------------------------------------------
 IMAGE_DIR = "images"
-LOCAL_DATA_PATH = "responses.csv"
 N_FEED_ITEMS = 10
 N_FOILS = 4
 
 
-# --------------------------------------------------
-# Utility functions
-# --------------------------------------------------
+def append_row_to_supabase(row: dict) -> None:
+    url = st.secrets["SUPABASE_URL"].rstrip("/")
+    key = st.secrets["SUPABASE_KEY"]
+
+    endpoint = f"{url}/rest/v1/responses"
+
+    headers = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",
+    }
+
+    response = requests.post(endpoint, json=row, headers=headers, timeout=10)
+
+    if response.status_code not in [200, 201, 204]:
+        raise Exception(
+            f"Supabase insert failed: {response.status_code} - {response.text}"
+        )
+
+
 def infer_metadata_from_filename(filename: str) -> dict:
-    """
-    Infer simple metadata from the filename.
-    Current filenames supported:
-    beach.jpg
-    eiffel_bright.jpg
-    eiffel_dark.jpg
-    forest_bright.jpg
-    forest_dark.jpg
-    lighthouse_bright.jpg
-    lighthouse_brighter.jpg
-    lighthouse_darker.jpg
-    ocean_bright.jpg
-    ocean_dark.jpg
-    sunset_noperson.jpg
-    sunset_person.jpg
-    trees_bright.jpg
-    trees_dark.jpg
-    """
     stem = os.path.splitext(filename)[0].lower()
     tokens = stem.split("_")
+    base_token = tokens[0]
 
     category_map = {
         "beach": "travel",
@@ -62,10 +56,9 @@ def infer_metadata_from_filename(filename: str) -> dict:
         "trees": "travel",
     }
 
-    base_token = tokens[0]
     category = category_map.get(base_token, "unknown")
-
     has_face = 1 if "person" in tokens else 0
+    has_text = 0
 
     if "bright" in tokens or "brighter" in tokens:
         colorfulness = "bright"
@@ -74,8 +67,12 @@ def infer_metadata_from_filename(filename: str) -> dict:
     else:
         colorfulness = "unknown"
 
-    has_text = 0
-    visual_complexity = "unknown"
+    if base_token in {"ocean", "forest", "lighthouse"}:
+        visual_complexity = "low"
+    elif base_token in {"eiffel", "sunset", "trees", "beach"}:
+        visual_complexity = "medium"
+    else:
+        visual_complexity = "unknown"
 
     return {
         "category": category,
@@ -87,10 +84,6 @@ def infer_metadata_from_filename(filename: str) -> dict:
 
 
 def load_stimuli(image_dir: str) -> list[dict]:
-    """
-    Load image filepaths from the images folder.
-    Returns a list of dicts with metadata inferred from filenames.
-    """
     allowed_exts = {".png", ".jpg", ".jpeg", ".webp"}
 
     if not os.path.exists(image_dir):
@@ -117,13 +110,14 @@ def initialize_session_state() -> None:
         "participant_id": str(uuid.uuid4()),
         "phase": "consent",
         "stimuli": [],
+        "feed_order": [],
+        "memory_items": [],
         "feed_index": 0,
         "memory_index": 0,
         "current_start_time": None,
         "responses": [],
-        "feed_order": [],
-        "memory_items": [],
-        "seen_post_ids": [],
+        "liked_posts": set(),
+        "supabase_error": None,
     }
 
     for key, value in defaults.items():
@@ -144,51 +138,48 @@ def prepare_experiment() -> None:
     random.shuffle(shuffled)
 
     seen_items = shuffled[:N_FEED_ITEMS]
-    remaining_items = shuffled[N_FEED_ITEMS:]
-    foil_items = remaining_items[:N_FOILS]
+    foil_items = shuffled[N_FEED_ITEMS:N_FEED_ITEMS + N_FOILS]
 
-    memory_items = []
-    for item in seen_items:
-        memory_items.append({**item, "was_seen": 1})
-    for item in foil_items:
-        memory_items.append({**item, "was_seen": 0})
-
+    memory_items = [{**item, "was_seen": 1} for item in seen_items]
+    memory_items += [{**item, "was_seen": 0} for item in foil_items]
     random.shuffle(memory_items)
 
     st.session_state.stimuli = stimuli
     st.session_state.feed_order = seen_items
     st.session_state.memory_items = memory_items
-    st.session_state.seen_post_ids = [item["post_id"] for item in seen_items]
     st.session_state.feed_index = 0
     st.session_state.memory_index = 0
     st.session_state.responses = []
+    st.session_state.liked_posts = set()
     st.session_state.current_start_time = time.time()
+    st.session_state.supabase_error = None
 
 
 def log_response(row: dict) -> None:
     st.session_state.responses.append(row)
 
-
-def save_responses_locally() -> None:
-    if not st.session_state.responses:
-        return
-
-    df = pd.DataFrame(st.session_state.responses)
-
-    if os.path.exists(LOCAL_DATA_PATH):
-        existing = pd.read_csv(LOCAL_DATA_PATH)
-        combined = pd.concat([existing, df], ignore_index=True)
-        combined.to_csv(LOCAL_DATA_PATH, index=False)
-    else:
-        df.to_csv(LOCAL_DATA_PATH, index=False)
+    try:
+        append_row_to_supabase(row)
+    except Exception as e:
+        st.session_state.supabase_error = str(e)
 
 
-# --------------------------------------------------
-# UI helpers
-# --------------------------------------------------
+def reset_study() -> None:
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
+    st.rerun()
+
+
 def render_header() -> None:
-    st.title("Social Media Memorability Study")
-    st.caption("A research project on engagement, attention, and memory")
+    st.title("Social Media Study")
+    st.caption("A classroom research project on engagement and memory")
+
+    if st.session_state.get("supabase_error"):
+        st.warning(
+            "Data may not be saving to Supabase right now. "
+            "Please check your connection or table permissions."
+        )
+        st.error(st.session_state.supabase_error)
 
 
 def render_progress(current: int, total: int, label: str) -> None:
@@ -196,19 +187,18 @@ def render_progress(current: int, total: int, label: str) -> None:
     st.progress(progress, text=f"{label}: {current} / {total}")
 
 
-# --------------------------------------------------
-# Phase 1: Consent
-# --------------------------------------------------
 def render_consent() -> None:
     render_header()
 
     st.subheader("Consent")
     st.write(
-        "You are being asked to take part in a short study about how people view and remember social media content. "
-        "Your responses are anonymous. Please do not enter any personal identifying information."
+        "You are being asked to take part in a short study about how people view "
+        "and remember social media content. Your responses are anonymous. Please "
+        "do not enter any personal identifying information."
     )
     st.write(
-        "By continuing, you confirm that you are at least 18 years old and consent to participate in this study."
+        "By continuing, you confirm that you are at least 18 years old and consent "
+        "to participate in this study."
     )
 
     agreed = st.checkbox("I agree to participate.")
@@ -219,9 +209,6 @@ def render_consent() -> None:
         st.rerun()
 
 
-# --------------------------------------------------
-# Phase 2: Feed viewing
-# --------------------------------------------------
 def render_feed() -> None:
     render_header()
 
@@ -231,9 +218,13 @@ def render_feed() -> None:
 
     if idx >= total:
         st.session_state.phase = "distractor"
+        st.session_state.current_start_time = time.time()
         st.rerun()
 
     item = feed_items[idx]
+    post_id = item["post_id"]
+    liked_already = post_id in st.session_state.liked_posts
+
     render_progress(idx + 1, total, "Viewing feed")
 
     st.subheader("View this post as you normally would")
@@ -242,18 +233,24 @@ def render_feed() -> None:
     col1, col2 = st.columns(2)
 
     with col1:
-        like_clicked = st.button("❤️ Like", key=f"like_{idx}")
+        if st.button(
+            "❤️ Liked" if liked_already else "🤍 Like",
+            key=f"like_{idx}",
+            use_container_width=True,
+        ):
+            if not liked_already:
+                st.session_state.liked_posts.add(post_id)
+            else:
+                st.session_state.liked_posts.remove(post_id)
+            st.rerun()
 
     with col2:
-        next_clicked = st.button("Next", key=f"next_{idx}")
+        if st.button("Next", key=f"next_{idx}", use_container_width=True):
+            end_time = time.time()
+            start_time = st.session_state.current_start_time or end_time
+            dwell_time = round(end_time - start_time, 3)
 
-    if like_clicked or next_clicked:
-        end_time = time.time()
-        start_time = st.session_state.current_start_time or end_time
-        dwell_time = round(end_time - start_time, 3)
-
-        log_response(
-            {
+            row = {
                 "participant_id": st.session_state.participant_id,
                 "timestamp_utc": datetime.utcnow().isoformat(),
                 "phase": "feed",
@@ -264,23 +261,21 @@ def render_feed() -> None:
                 "colorfulness": item.get("colorfulness"),
                 "visual_complexity": item.get("visual_complexity"),
                 "was_seen": 1,
-                "liked": 1 if like_clicked else 0,
+                "liked": 1 if post_id in st.session_state.liked_posts else 0,
                 "response": None,
                 "correct": None,
                 "confidence": None,
                 "dwell_time_sec": dwell_time,
                 "feed_position": idx + 1,
             }
-        )
 
-        st.session_state.feed_index += 1
-        st.session_state.current_start_time = time.time()
-        st.rerun()
+            log_response(row)
+
+            st.session_state.feed_index += 1
+            st.session_state.current_start_time = time.time()
+            st.rerun()
 
 
-# --------------------------------------------------
-# Phase 3: Distractor task
-# --------------------------------------------------
 def render_distractor() -> None:
     render_header()
 
@@ -294,34 +289,31 @@ def render_distractor() -> None:
     )
 
     if st.button("Continue to Memory Test", type="primary", disabled=choice is None):
-        log_response(
-            {
-                "participant_id": st.session_state.participant_id,
-                "timestamp_utc": datetime.utcnow().isoformat(),
-                "phase": "distractor",
-                "post_id": None,
-                "category": None,
-                "has_face": None,
-                "has_text": None,
-                "colorfulness": None,
-                "visual_complexity": None,
-                "was_seen": None,
-                "liked": None,
-                "response": choice,
-                "correct": None,
-                "confidence": None,
-                "dwell_time_sec": None,
-                "feed_position": None,
-            }
-        )
+        row = {
+            "participant_id": st.session_state.participant_id,
+            "timestamp_utc": datetime.utcnow().isoformat(),
+            "phase": "distractor",
+            "post_id": None,
+            "category": None,
+            "has_face": None,
+            "has_text": None,
+            "colorfulness": None,
+            "visual_complexity": None,
+            "was_seen": None,
+            "liked": None,
+            "response": choice,
+            "correct": None,
+            "confidence": None,
+            "dwell_time_sec": None,
+            "feed_position": None,
+        }
+
+        log_response(row)
         st.session_state.phase = "memory"
         st.session_state.current_start_time = time.time()
         st.rerun()
 
 
-# --------------------------------------------------
-# Phase 4: Memory test
-# --------------------------------------------------
 def render_memory_test() -> None:
     render_header()
 
@@ -330,7 +322,6 @@ def render_memory_test() -> None:
     total = len(memory_items)
 
     if idx >= total:
-        save_responses_locally()
         st.session_state.phase = "done"
         st.rerun()
 
@@ -363,49 +354,46 @@ def render_memory_test() -> None:
         guessed_seen = 1 if seen_before == "Yes, I saw it" else 0
         correct = 1 if guessed_seen == item["was_seen"] else 0
 
-        log_response(
-            {
-                "participant_id": st.session_state.participant_id,
-                "timestamp_utc": datetime.utcnow().isoformat(),
-                "phase": "memory",
-                "post_id": item["post_id"],
-                "category": item.get("category"),
-                "has_face": item.get("has_face"),
-                "has_text": item.get("has_text"),
-                "colorfulness": item.get("colorfulness"),
-                "visual_complexity": item.get("visual_complexity"),
-                "was_seen": item["was_seen"],
-                "liked": None,
-                "response": guessed_seen,
-                "correct": correct,
-                "confidence": confidence,
-                "dwell_time_sec": dwell_time,
-                "feed_position": None,
-            }
-        )
+        row = {
+            "participant_id": st.session_state.participant_id,
+            "timestamp_utc": datetime.utcnow().isoformat(),
+            "phase": "memory",
+            "post_id": item["post_id"],
+            "category": item.get("category"),
+            "has_face": item.get("has_face"),
+            "has_text": item.get("has_text"),
+            "colorfulness": item.get("colorfulness"),
+            "visual_complexity": item.get("visual_complexity"),
+            "was_seen": item["was_seen"],
+            "liked": None,
+            "response": str(guessed_seen),
+            "correct": correct,
+            "confidence": confidence,
+            "dwell_time_sec": dwell_time,
+            "feed_position": None,
+        }
+
+        log_response(row)
 
         st.session_state.memory_index += 1
         st.session_state.current_start_time = time.time()
         st.rerun()
 
 
-# --------------------------------------------------
-# Phase 5: Debrief
-# --------------------------------------------------
 def render_done() -> None:
     render_header()
 
     st.success("You have completed the study. Thank you!")
     st.write("Your responses have been recorded.")
 
+    if st.button("Start Over"):
+        reset_study()
+
     with st.expander("Researcher view: session summary"):
         df = pd.DataFrame(st.session_state.responses)
         st.dataframe(df, use_container_width=True)
 
 
-# --------------------------------------------------
-# Main app router
-# --------------------------------------------------
 def main() -> None:
     initialize_session_state()
 
@@ -423,9 +411,7 @@ def main() -> None:
         render_done()
     else:
         st.error("Unknown app state. Resetting session.")
-        for key in list(st.session_state.keys()):
-            del st.session_state[key]
-        st.rerun()
+        reset_study()
 
 
 if __name__ == "__main__":
